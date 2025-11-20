@@ -526,8 +526,8 @@ void *ASPathGetNode(ASPath path, size_t index) {
 #define CELL_ROBOT 3
 
 // Temporal filtering thresholds
-#define OBSTACLE_THRESHOLD 3
-#define FREE_THRESHOLD 2
+#define OBSTACLE_THRESHOLD 2
+#define FREE_THRESHOLD 3
 #define COUNTER_DECAY 1
 
 #define NEARBY_RADIUS_INNER 5
@@ -537,16 +537,16 @@ void *ASPathGetNode(ASPath path, size_t index) {
 #define MIN_BLOB_SIZE 3
 
 // Cost Map
-#define OBSTACLE_COST 300
+#define OBSTACLE_COST 200
 #define FREE_COST 1
-#define UNKNOWN_COST 10
+#define UNKNOWN_COST 30
 #define INFLATION_RADIUS 10
 
 // Frontiers
 #define MAX_FRONTIERS 100
 #define MIN_FRONTIER_SIZE 20
 #define MIN_FRONTIER_CLEARANCE 5
-#define FRONTIER_SAFETY_CHECK_RADIUS 10
+#define FRONTIER_SAFETY_CHECK_RADIUS 5
 
 // Colors
 #define COLOR_UNKNOWN 0x404040
@@ -556,12 +556,24 @@ void *ASPathGetNode(ASPath path, size_t index) {
 #define COLOR_BACKGROUND 0x303030
 
 // IR Safety Configuration
-#define IR_SAFETY_THRESHOLD 0.15  // Stop if any sensor detects obstacle closer than this (in meters)
-#define IR_CRITICAL_THRESHOLD 0.10  // Emergency stop threshold
+#define IR_SAFETY_THRESHOLD 0.10  // Stop if any sensor detects obstacle closer than this (in meters)
+#define IR_CRITICAL_THRESHOLD 0.05  // Emergency stop threshold
 
 
 
 // ====== Structures =======
+
+// State Machine
+typedef enum {
+    STATE_START, // Check if too close to an obstacle
+    STATE_FRONTIER_EXPLORE,
+    STATE_NAV_TO_BLUE,
+    STATE_NAV_TO_YELLOW,
+    STATE_COLLISION,
+    STATE_WANDER
+} State;
+
+
 // Point structure
 typedef struct {
     int x;
@@ -685,9 +697,9 @@ bool check_ir_safety(double* min_distance, int* sensor_index) {
 
 void emergency_stop() {
     for (int i = 0; i < 4; i++) {
-        //wb_motor_set_velocity(motors[i], 0.0);
+        wb_motor_set_velocity(motors[i], 0.0);
     }
-    //printf("EMERGENCY STOP: IR safety triggered!\n");
+    printf("EMERGENCY STOP: IR safety triggered!\n");
 }
 
 // =========== UTILITIES =============
@@ -872,9 +884,9 @@ void smooth_path(GridPath* path) {
 
 // =============== ROBOT CONTROL ===============
 double pid_rotate(double angle_error) {
-    static double Kp_rotate = 3.0;  
-    static double Ki_rotate = 0.01;  
-    static double Kd_rotate = 0.5;  
+    static double Kp_rotate = 1.0;  
+    static double Ki_rotate = 0.0001;  
+    static double Kd_rotate = 0.001;  
     
     double integral_limit = 1.0;  
     pid_rotate_integral += angle_error * (TIME_STEP / 1000.0);
@@ -889,18 +901,13 @@ double pid_rotate(double angle_error) {
 }
 
 double pid_translate(double distance_error) {
-    static double Kp_translate = 0.05; 
-    static double Ki_translate = 0.0;  
-    static double Kd_translate = 0.0001;  
-    
-    double integral_limit = 0.5;  
-    pid_translate_integral += distance_error * (TIME_STEP / 1000.0);
-    pid_translate_integral = clamp(pid_translate_integral, -integral_limit, integral_limit);
+    static double Kp_translate = 0.02;  
+    static double Kd_translate = 0.0;  
     
     double derivative = (distance_error - pid_translate_prev_error) / (TIME_STEP / 1000.0);
     pid_translate_prev_error = distance_error;
     
-    double speed = Kp_translate * distance_error + Ki_translate * pid_translate_integral + Kd_translate * derivative;
+    double speed = Kp_translate * distance_error + Kd_translate * derivative;
     
     return clamp(speed, 0, 2.0);
 }
@@ -913,17 +920,58 @@ void reset_pid_controllers() {
 }
 
 
+double rotate_drive(double rotations, double angle_threshold, double b, double r) {
+    // Rotation in radians (full rotations)
+    double radians_target = rotations * 2.0 * M_PI;
+
+    // Current orientation based on rotation matrix
+    const double* orientation = wb_supervisor_node_get_orientation(robot_node);
+    double robot_theta = atan2(orientation[3], orientation[0]);
+
+    // Angle difference
+    double angle_diff = normalize_angle(radians_target - robot_theta);
+
+    // --- stop condition ---
+    if (fabs(angle_diff) < angle_threshold) {
+        // Stop motors
+        wb_motor_set_velocity(motors[0], 0);
+        wb_motor_set_velocity(motors[1], 0);
+        wb_motor_set_velocity(motors[2], 0);
+        wb_motor_set_velocity(motors[3], 0);
+
+        return 1.0; // success
+    }
+
+    // PID angular velocity command
+    double omega = pid_rotate(angle_diff);
+
+    // Convert body angular velocity to wheel velocities
+    double omega_l = (-omega * b / 2.0) / r;
+    double omega_r = (+omega * b / 2.0) / r;
+
+    // Set wheel velocities correctly
+    wb_motor_set_velocity(motors[0], omega_l); // left front
+    wb_motor_set_velocity(motors[1], omega_l); // left rear
+    wb_motor_set_velocity(motors[2], omega_r); // right front
+    wb_motor_set_velocity(motors[3], omega_r); // right rear
+
+    return 0.0; // still rotating
+}
+
+
+
 bool diff_drive(int x_goal, int y_goal, double distance_threshold, 
                 double angle_threshold, double b, double r) {
     // IR Safety Check
     double min_ir_distance;
     int triggered_sensor;
-    bool ir_safe = check_ir_safety(&min_ir_distance, &triggered_sensor);
+    bool ir_safe = 1;
+    //bool ir_safe = check_ir_safety(&min_ir_distance, &triggered_sensor);
     
     if (!ir_safe) {
         if (min_ir_distance < IR_CRITICAL_THRESHOLD) {
             // Critical distance - emergency stop
-            emergency_stop();
+            //emergency_stop();
             ir_safety_triggered = true;
             printf("CRITICAL: IR sensor %s detected obstacle at %.3fm - EMERGENCY STOP\n", 
                    ir_sensor_names[triggered_sensor], min_ir_distance);
@@ -1820,11 +1868,20 @@ int main(int argc, char **argv) {
     int frame_count = 0;
     
     
+    rotate_drive(2, 0.3, 0.287, 0.0825);
+    
+    
+    
+    
+    
+    
     
     // ============= MAIN LOOOOOP =============
     
     while (wb_robot_step(TIME_STEP) != -1) {
         frame_count++;
+        
+        
         
         process_lidar();
         
@@ -1849,7 +1906,7 @@ int main(int argc, char **argv) {
                 current_path = NULL;
             }
             
-            if (frame_count % 50 == 0) {
+            if (frame_count % 100 == 0) {
                 destroy_grid_path(current_path);
                 current_path = NULL;
             }
