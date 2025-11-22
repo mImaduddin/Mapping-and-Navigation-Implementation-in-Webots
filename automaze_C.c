@@ -1,10 +1,11 @@
 // File Name: automaze_C.c
-// Version: 1.5.0
+// Version: 1.6.0
 // Last Modified: 22.11.2025
 
 // Change Log:
 // Fixed the jerky motion due to mistuned PID translate, 20.11.2025
 // Fixed the memory leak issue in render display, 22.11.2025
+// Fixed the Cost map EDT and obstacle inflation, 22.11.2025
 
 #include <webots/robot.h>
 #include <webots/lidar.h>
@@ -636,6 +637,12 @@ static WbDeviceTag lidar;
 static WbDeviceTag motors[4];
 static WbNodeRef robot_node;
 
+
+static FrontierCentroid frontiers[MAX_FRONTIERS];
+static int num_frontiers = 0;
+static double frontier_min_score = 0.0;
+static double frontier_max_score = 1.0;
+
 static WbDeviceTag ir_sensors[4];
 static const char* ir_sensor_names[4] = {
     "fl_range", "fr_range", "rl_range", "rr_range"
@@ -861,43 +868,6 @@ void destroy_grid_path(GridPath* path) {
     }
 }
 
-void smooth_path(GridPath* path) {
-    if (!path || path->count < 3) return;
-    
-    int write_idx = 1;
-    
-    for (int i = 1; i < path->count - 1; i++) {
-        GridNode* prev = &path->nodes[write_idx - 1];
-        GridNode* next = &path->nodes[i + 1];
-        
-        bool has_los = true;
-        
-        int dx = abs(next->x - prev->x);
-        int dy = abs(next->y - prev->y);
-        int sx = prev->x < next->x ? 1 : -1;
-        int sy = prev->y < next->y ? 1 : -1;
-        int err = dx - dy;
-        int x = prev->x, y = prev->y;
-        
-        while (x != next->x || y != next->y) {
-            if (!is_valid_cell(x, y) || grid[y][x] == CELL_OBSTACLE) {
-                has_los = false;
-                break;
-            }
-            
-            int e2 = 2 * err;
-            if (e2 > -dy) { err -= dy; x += sx; }
-            if (e2 < dx) { err += dx; y += sy; }
-        }
-        
-        if (!has_los) {
-            path->nodes[write_idx++] = path->nodes[i];
-        }
-    }
-    
-    path->nodes[write_idx++] = path->nodes[path->count - 1];
-    path->count = write_idx;
-}
 
 // =============== ROBOT CONTROL ===============
 double pid_rotate(double angle_error) {
@@ -1297,42 +1267,107 @@ void decay_counters() {
     }
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+inline void relax(double dist_transform[GRID_SIZE][GRID_SIZE],
+                  int x, int y, int nx, int ny, double cost)
+{
+    double new_dist = dist_transform[ny][nx] + cost;
+    if (new_dist < dist_transform[y][x])
+        dist_transform[y][x] = new_dist;
+}
+
 void generate_cost_map() {
+    static double dist_transform[GRID_SIZE][GRID_SIZE];
+    const double INF = GRID_SIZE * GRID_SIZE * 2.0;
+    const double SQRT2 = 1.414213562;
+
+    // ---- Step 1: Initialize ----
     for (int y = 0; y < GRID_SIZE; y++) {
         for (int x = 0; x < GRID_SIZE; x++) {
-            if (grid[y][x] == CELL_OBSTACLE)
-                cost_map[y][x] = OBSTACLE_COST;
-            else if (grid[y][x] == CELL_UNKNOWN)
-                cost_map[y][x] = UNKNOWN_COST;
-            else
-                cost_map[y][x] = FREE_COST;
+            dist_transform[y][x] =
+                (grid[y][x] == CELL_OBSTACLE) ? 0.0 : INF;
         }
     }
 
+    // Offsets and costs: 8 directions
+    const int dx[8]   = {-1,  0, -1,  1,  1,  0,  1, -1};
+    const int dy[8]   = { 0, -1, -1, -1,  0,  1,  1,  1};
+    const double w[8] = { 1,   1,  SQRT2, SQRT2, 1,  1, SQRT2, SQRT2 };
+
+    // ---- Step 2: Forward pass ----
     for (int y = 0; y < GRID_SIZE; y++) {
         for (int x = 0; x < GRID_SIZE; x++) {
-            if (grid[y][x] == CELL_FREE) {
-                double min_dist = INFLATION_RADIUS + 1;
-                for (int dy = -INFLATION_RADIUS; dy <= INFLATION_RADIUS; dy++) {
-                    for (int dx = -INFLATION_RADIUS; dx <= INFLATION_RADIUS; dx++) {
-                        int nx = x + dx;
-                        int ny = y + dy;
-                        if (!is_valid_cell(nx, ny)) continue;
-                        if (grid[ny][nx] == CELL_OBSTACLE) {
-                            double dist = sqrt(dx * dx + dy * dy);
-                            if (dist < min_dist)
-                                min_dist = dist;
-                        }
-                    }
-                }
-                if (min_dist <= INFLATION_RADIUS) {
-                    double inflated = FREE_COST + (OBSTACLE_COST - FREE_COST) * exp(-min_dist / INFLATION_RADIUS);
-                    cost_map[y][x] = clamp(inflated, FREE_COST, OBSTACLE_COST);
-                }
+            if (dist_transform[y][x] == 0) continue;
+
+            for (int k = 0; k < 4; k++) {  // first 4 directions = forward neighbors
+                int nx = x + dx[k];
+                int ny = y + dy[k];
+                if (nx >= 0 && ny >= 0 && nx < GRID_SIZE && ny < GRID_SIZE)
+                    relax(dist_transform, x, y, nx, ny, w[k]);
+            }
+        }
+    }
+
+    // ---- Step 3: Backward pass ----
+    for (int y = GRID_SIZE - 1; y >= 0; y--) {
+        for (int x = GRID_SIZE - 1; x >= 0; x--) {
+            if (dist_transform[y][x] == 0) continue;
+
+            for (int k = 4; k < 8; k++) {  // last 4 directions = backward neighbors
+                int nx = x + dx[k];
+                int ny = y + dy[k];
+                if (nx >= 0 && ny >= 0 && nx < GRID_SIZE && ny < GRID_SIZE)
+                    relax(dist_transform, x, y, nx, ny, w[k]);
+            }
+        }
+    }
+
+    // ---- Step 4: Convert to cost map ----
+    for (int y = 0; y < GRID_SIZE; y++) {
+        for (int x = 0; x < GRID_SIZE; x++) {
+
+            if (grid[y][x] == CELL_OBSTACLE) {
+                cost_map[y][x] = OBSTACLE_COST;
+                continue;
+            }
+
+            if (grid[y][x] == CELL_UNKNOWN) {
+                cost_map[y][x] = UNKNOWN_COST;
+                continue;
+            }
+
+            double dist = dist_transform[y][x];
+
+            if (dist <= INFLATION_RADIUS) {
+                double t = dist / INFLATION_RADIUS;
+                cost_map[y][x] = OBSTACLE_COST - t * (OBSTACLE_COST - FREE_COST);
+            } else {
+                cost_map[y][x] = FREE_COST;
             }
         }
     }
 }
+
+
+
+
+
+
+
+
+
 
 // =============== FRONTIER EXPLORATION ===============
 
@@ -1521,6 +1556,15 @@ void update_path_to_frontier() {
         printf("Failed to find path to frontier\n");
     }
 }
+
+
+
+
+
+
+
+
+
 
 // =============== DISPLAY RENDERING ===============
 
@@ -1966,7 +2010,7 @@ int main(int argc, char **argv) {
         }
         
         if (frame_count % 100 == 0) {
-            clear_nearby_obstacles(NEARBY_RADIUS_INNER, NEARBY_RADIUS_OUTER);
+            //clear_nearby_obstacles(NEARBY_RADIUS_INNER, NEARBY_RADIUS_OUTER);
         }
         
         generate_cost_map();
