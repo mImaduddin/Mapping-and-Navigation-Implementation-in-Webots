@@ -733,6 +733,12 @@ void world_to_grid(double wx, double wy, int* gx, int* gy) {
     *gy = (int)((wy / GRID_RESOLUTION) + GRID_SIZE / 2);
 }
 
+void grid_to_world(int gx, int gy, double* wx, double* wy) {
+    *wx = ((double)gx - GRID_SIZE / 2) * GRID_RESOLUTION;
+    *wy = ((double)gy - GRID_SIZE / 2) * GRID_RESOLUTION;
+}
+
+
 int is_valid_cell(int x, int y) {
     return x >= 0 && x < GRID_SIZE && y >= 0 && y < GRID_SIZE;
 }
@@ -872,8 +878,8 @@ void destroy_grid_path(GridPath* path) {
 // =============== ROBOT CONTROL ===============
 double pid_rotate(double angle_error) {
     static double Kp_rotate = 1.0;  
-    static double Ki_rotate = 0.0001;  
-    static double Kd_rotate = 0.001;  
+    static double Ki_rotate = 0.0;  
+    static double Kd_rotate = 0.0;  
     
     double integral_limit = 1.0;  
     pid_rotate_integral += angle_error * (TIME_STEP / 1000.0);
@@ -1079,7 +1085,7 @@ bool follow_path() {
     
     bool reached = diff_drive(
         waypoint->x, waypoint->y,
-        10.0, 0.3,
+        10.0, 1.0,
         0.287, 0.0825
     );
     
@@ -1221,7 +1227,7 @@ void process_lidar() {
     const float* ranges = wb_lidar_get_range_image(lidar);
     int resolution = wb_lidar_get_horizontal_resolution(lidar);
     double fov = wb_lidar_get_fov(lidar);
-    double max_range = 1.5;
+    double max_range = wb_lidar_get_max_range(lidar);
     
     for (int i = 0; i < resolution; i += 2) {
         double range = ranges[i];
