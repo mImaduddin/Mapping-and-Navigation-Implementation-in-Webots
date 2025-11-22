@@ -1,5 +1,5 @@
 // File Name: automaze_C.c
-// Version: 1.6.0
+// Version: 1.6.1
 // Last Modified: 22.11.2025
 
 // Change Log:
@@ -1284,7 +1284,7 @@ void decay_counters() {
 
 
 
-
+#include <math.h>
 
 inline void relax(double dist_transform[GRID_SIZE][GRID_SIZE],
                   int x, int y, int nx, int ny, double cost)
@@ -1294,30 +1294,33 @@ inline void relax(double dist_transform[GRID_SIZE][GRID_SIZE],
         dist_transform[y][x] = new_dist;
 }
 
-void generate_cost_map() {
+void generate_cost_map(void) {
     static double dist_transform[GRID_SIZE][GRID_SIZE];
-    const double INF = GRID_SIZE * GRID_SIZE * 2.0;
-    const double SQRT2 = 1.414213562;
+    const double INF      = GRID_SIZE * GRID_SIZE * 2.0;
+    const double SQRT2    = 1.414213562;
+    const double COST_SCALING = 0.05;  /* tune this */
 
-    // ---- Step 1: Initialize ----
-    for (int y = 0; y < GRID_SIZE; y++) {
-        for (int x = 0; x < GRID_SIZE; x++) {
+    int x, y, k;
+
+    /* ---- Step 1: Initialize ---- */
+    for (y = 0; y < GRID_SIZE; y++) {
+        for (x = 0; x < GRID_SIZE; x++) {
             dist_transform[y][x] =
                 (grid[y][x] == CELL_OBSTACLE) ? 0.0 : INF;
         }
     }
 
-    // Offsets and costs: 8 directions
+    /* Offsets and costs: 8 directions */
     const int dx[8]   = {-1,  0, -1,  1,  1,  0,  1, -1};
     const int dy[8]   = { 0, -1, -1, -1,  0,  1,  1,  1};
     const double w[8] = { 1,   1,  SQRT2, SQRT2, 1,  1, SQRT2, SQRT2 };
 
-    // ---- Step 2: Forward pass ----
-    for (int y = 0; y < GRID_SIZE; y++) {
-        for (int x = 0; x < GRID_SIZE; x++) {
-            if (dist_transform[y][x] == 0) continue;
+    /* ---- Step 2: Forward pass ---- */
+    for (y = 0; y < GRID_SIZE; y++) {
+        for (x = 0; x < GRID_SIZE; x++) {
+            if (dist_transform[y][x] == 0.0) continue;
 
-            for (int k = 0; k < 4; k++) {  // first 4 directions = forward neighbors
+            for (k = 0; k < 4; k++) {
                 int nx = x + dx[k];
                 int ny = y + dy[k];
                 if (nx >= 0 && ny >= 0 && nx < GRID_SIZE && ny < GRID_SIZE)
@@ -1326,12 +1329,12 @@ void generate_cost_map() {
         }
     }
 
-    // ---- Step 3: Backward pass ----
-    for (int y = GRID_SIZE - 1; y >= 0; y--) {
-        for (int x = GRID_SIZE - 1; x >= 0; x--) {
-            if (dist_transform[y][x] == 0) continue;
+    /* ---- Step 3: Backward pass ---- */
+    for (y = GRID_SIZE - 1; y >= 0; y--) {
+        for (x = GRID_SIZE - 1; x >= 0; x--) {
+            if (dist_transform[y][x] == 0.0) continue;
 
-            for (int k = 4; k < 8; k++) {  // last 4 directions = backward neighbors
+            for (k = 4; k < 8; k++) {
                 int nx = x + dx[k];
                 int ny = y + dy[k];
                 if (nx >= 0 && ny >= 0 && nx < GRID_SIZE && ny < GRID_SIZE)
@@ -1340,9 +1343,9 @@ void generate_cost_map() {
         }
     }
 
-    // ---- Step 4: Convert to cost map ----
-    for (int y = 0; y < GRID_SIZE; y++) {
-        for (int x = 0; x < GRID_SIZE; x++) {
+    /* ---- Step 4: Convert to EDT-based cost map ---- */
+    for (y = 0; y < GRID_SIZE; y++) {
+        for (x = 0; x < GRID_SIZE; x++) {
 
             if (grid[y][x] == CELL_OBSTACLE) {
                 cost_map[y][x] = OBSTACLE_COST;
@@ -1354,17 +1357,26 @@ void generate_cost_map() {
                 continue;
             }
 
-            double dist = dist_transform[y][x];
+            {
+                double dist = dist_transform[y][x];
 
-            if (dist <= INFLATION_RADIUS) {
-                double t = dist / INFLATION_RADIUS;
-                cost_map[y][x] = OBSTACLE_COST - t * (OBSTACLE_COST - FREE_COST);
-            } else {
-                cost_map[y][x] = FREE_COST;
+                /* No known obstacle nearby */
+                if (dist >= INF * 0.5) {
+                    cost_map[y][x] = FREE_COST;
+                } else if (dist <= INFLATION_RADIUS) {
+                    /* Use EDT within inflation band; INFLATION_RADIUS only
+                       limits the band, not the definition of distance */
+                    double factor = exp(-COST_SCALING * dist);
+                    cost_map[y][x] =
+                        FREE_COST + factor * (OBSTACLE_COST - FREE_COST);
+                } else {
+                    cost_map[y][x] = FREE_COST;
+                }
             }
         }
     }
 }
+
 
 
 
