@@ -1,3 +1,10 @@
+// File Name: automaze_C.c
+// Version: 1.5.0
+// Last Modified: 22.11.2025
+
+// Change Log:
+// Fixed the jerky motion due to mistuned PID translate, 20.11.2025
+// Fixed the memory leak issue in render display, 22.11.2025
 
 #include <webots/robot.h>
 #include <webots/lidar.h>
@@ -185,6 +192,8 @@ static inline int NodeKeyCompare(Node node, void *nodeKey) {
     }
 }
 
+
+
 static inline Node GetNode(VisitedNodes nodes, void *nodeKey) {
     if (!nodeKey) return NodeNull;
     
@@ -215,7 +224,12 @@ static inline Node GetNode(VisitedNodes nodes, void *nodeKey) {
     Node node = NodeMake(nodes, nodes->nodeRecordsCount);
     nodes->nodeRecordsCount++;
     
-    memmove(&nodes->nodeRecordsIndex[first+1], &nodes->nodeRecordsIndex[first], (nodes->nodeRecordsCapacity - first - 1) * sizeof(size_t));
+    // FIX: Use nodeRecordsCount instead of nodeRecordsCapacity for memmove
+    if (first < nodes->nodeRecordsCount - 1) {
+        memmove(&nodes->nodeRecordsIndex[first+1], 
+                &nodes->nodeRecordsIndex[first], 
+                (nodes->nodeRecordsCount - first - 1) * sizeof(size_t));
+    }
     nodes->nodeRecordsIndex[first] = node.index;
     
     NodeRecord *record = NodeGetRecord(node);
@@ -224,6 +238,9 @@ static inline Node GetNode(VisitedNodes nodes, void *nodeKey) {
     
     return node;
 }
+
+
+
 
 static inline void SwapOpenSetNodesAtIndexes(VisitedNodes nodes, size_t index1, size_t index2) {
     if (index1 != index2) {
@@ -533,8 +550,8 @@ void *ASPathGetNode(ASPath path, size_t index) {
 #define NEARBY_RADIUS_INNER 5
 #define NEARBY_RADIUS_OUTER 15
 
-#define MAX_QUEUE 10000
-#define MIN_BLOB_SIZE 3
+#define MAX_QUEUE 1000
+#define MIN_BLOB_SIZE 8
 
 // Cost Map
 #define OBSTACLE_COST 200
@@ -1044,28 +1061,42 @@ bool diff_drive(int x_goal, int y_goal, double distance_threshold,
 
 
 
-
-
-
-
-
 bool follow_path() {
     if (!current_path || current_waypoint >= current_path->count) {
         return false;
     }
     
-    // Skip waypoints that are too close together
+    // Track if we're making progress
+    static int stuck_counter = 0;
+    static int last_waypoint = -1;
+    
+    if (current_waypoint == last_waypoint) {
+        stuck_counter++;
+        if (stuck_counter > 50) { // Stuck for 50 frames
+            printf("Path following stuck, replanning...\n");
+            destroy_grid_path(current_path);
+            current_path = NULL;
+            stuck_counter = 0;
+            last_waypoint = -1;
+            return true; // Force replan
+        }
+    } else {
+        stuck_counter = 0;
+        last_waypoint = current_waypoint;
+    }
+    
+    // Rest of the path following logic...
     const double* position = wb_supervisor_node_get_position(robot_node);
     int robot_gx, robot_gy;
     world_to_grid(position[0], position[1], &robot_gx, &robot_gy);
     
+    // Skip close waypoints
     while (current_waypoint < current_path->count - 1) {
         GridNode* next_wp = &current_path->nodes[current_waypoint];
         double dx = next_wp->x - robot_gx;
         double dy = next_wp->y - robot_gy;
         double dist = sqrt(dx * dx + dy * dy);
         
-        // Skip if waypoint is very close
         if (dist < 10.0) {
             current_waypoint++;
             reset_pid_controllers();
@@ -1094,6 +1125,10 @@ bool follow_path() {
     
     return false;
 }
+
+
+
+
 
 // =============== MAPPING AND PERCEPTION ===============
 
@@ -1635,7 +1670,28 @@ void display_ir_status(int frame_count) {
     }
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
 void render_display_with_path(int frame_count) {
+    // Lazy one-time font initialization to avoid repeated font allocations
+    static bool font_initialized = false;
+    if (!font_initialized) {
+        wb_display_set_font(display, "Arial", 12, 0);
+        font_initialized = true;
+    }
+
+    // Clear background
     wb_display_set_color(display, COLOR_BACKGROUND);
     wb_display_fill_rectangle(display, 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 
@@ -1655,135 +1711,153 @@ void render_display_with_path(int frame_count) {
     int grid_start_y = robot_gy - half_viewport;
     int grid_end_y = robot_gy + half_viewport;
 
+    // Draw visible cells. Minimize set_color calls by tracking last_color.
+    unsigned int last_color = 0xFFFFFFFF; // impossible to match
     for (int gy = grid_start_y; gy <= grid_end_y; gy++) {
         for (int gx = grid_start_x; gx <= grid_end_x; gx++) {
             if (!is_valid_cell(gx, gy)) continue;
 
-            unsigned int color = COLOR_UNKNOWN;
+            unsigned int color;
+            unsigned int cell = grid[gy][gx];
 
-            if (grid[gy][gx] == CELL_UNKNOWN) {
-                color = COLOR_UNKNOWN;
-            } else if (grid[gy][gx] == CELL_OBSTACLE) {
+            if (cell == CELL_UNKNOWN) {
+                continue; // skip unknown for performance
+            } else if (cell == CELL_OBSTACLE) {
                 color = COLOR_OBSTACLE;
-            } else if (grid[gy][gx] == CELL_ROBOT) {
-                continue;
-            } else {
+            } else if (cell == CELL_ROBOT) {
+                continue; // robot rendered later at center
+            } else { // free or others
                 double c = cost_map[gy][gx];
                 color = cost_to_color(c);
             }
 
+            if (color != last_color) {
+                wb_display_set_color(display, color);
+                last_color = color;
+            }
+
             int screen_x = (int)((gx - grid_start_x) * scale);
             int screen_y = DISPLAY_HEIGHT - (int)((gy - grid_start_y + 1) * scale);
+            wb_display_fill_rectangle(display, screen_x, screen_y, cell_size, cell_size);
+        }
+    }
 
-            if (grid[gy][gx] != CELL_UNKNOWN) {
-                wb_display_set_color(display, color);
-                wb_display_fill_rectangle(display, screen_x, screen_y, cell_size, cell_size);
+    // Draw path (cheap early-out)
+    if (current_path && current_path->count > 0) {
+        // set color once for path lines
+        wb_display_set_color(display, 0x00FF00);
+        for (int i = 0; i < current_path->count - 1; ++i) {
+            GridNode* n1 = &current_path->nodes[i];
+            GridNode* n2 = &current_path->nodes[i + 1];
+            int x1 = (int)((n1->x - grid_start_x) * scale);
+            int y1 = DISPLAY_HEIGHT - (int)((n1->y - grid_start_y + 1) * scale);
+            int x2 = (int)((n2->x - grid_start_x) * scale);
+            int y2 = DISPLAY_HEIGHT - (int)((n2->y - grid_start_y + 1) * scale);
+            wb_display_draw_line(display, x1, y1, x2, y2);
+        }
+
+        // draw nodes (reuse a single color change)
+        wb_display_set_color(display, 0x0000FF);
+        for (int i = 0; i < current_path->count; ++i) {
+            GridNode* n = &current_path->nodes[i];
+            int x = (int)((n->x - grid_start_x) * scale);
+            int y = DISPLAY_HEIGHT - (int)((n->y - grid_start_y + 1) * scale);
+            if (i == current_waypoint) {
+                wb_display_set_color(display, 0xFF00FF);
+                wb_display_fill_oval(display, x - 3, y - 3, 6, 6);
+                wb_display_set_color(display, 0x0000FF); // restore
+            } else {
+                wb_display_draw_oval(display, x - 2, y - 2, 4, 4);
             }
         }
     }
 
-    draw_path_on_display(display, current_path, robot_gx, robot_gy, 
-                        scale, grid_start_x, grid_start_y);
-
+    // Frontiers: update every N calls (keeps same behaviour).
     static FrontierCentroid frontiers[MAX_FRONTIERS];
     static int num_frontiers = 0;
     static int frontier_update_counter = 0;
-    
     if (++frontier_update_counter >= 20) {
         frontier_update_counter = 0;
         num_frontiers = find_frontier_centroids(frontiers, MAX_FRONTIERS);
     }
 
-    double min_score = 1e9, max_score = -1e9;
-    for (int i = 0; i < num_frontiers; i++) {
-        if (frontiers[i].score < min_score) min_score = frontiers[i].score;
-        if (frontiers[i].score > max_score) max_score = frontiers[i].score;
-    }
-    if (min_score == 1e9) { min_score = 0.0; max_score = 1.0; }
+    if (num_frontiers > 0) {
+        double min_score = 1e9, max_score = -1e9;
+        for (int i = 0; i < num_frontiers; ++i) {
+            if (frontiers[i].score < min_score) min_score = frontiers[i].score;
+            if (frontiers[i].score > max_score) max_score = frontiers[i].score;
+        }
+        if (min_score == 1e9) { min_score = 0.0; max_score = 1.0; }
 
-    for (int i = 0; i < num_frontiers; i++) {
-        int fx = frontiers[i].x;
-        int fy = frontiers[i].y;
-        
-        if (fx >= grid_start_x && fx <= grid_end_x &&
-            fy >= grid_start_y && fy <= grid_end_y) {
-            
+        // draw frontier markers
+        for (int i = 0; i < num_frontiers; ++i) {
+            int fx = frontiers[i].x;
+            int fy = frontiers[i].y;
+            if (fx < grid_start_x || fx > grid_end_x || fy < grid_start_y || fy > grid_end_y) continue;
+
             int screen_x = (int)((fx - grid_start_x) * scale);
             int screen_y = DISPLAY_HEIGHT - (int)((fy - grid_start_y + 1) * scale);
-            
+
             unsigned int fcolor = frontier_score_to_color(frontiers[i].score, min_score, max_score);
             wb_display_set_color(display, fcolor);
-
             int marker_half = 6;
             wb_display_fill_rectangle(display, screen_x - 1, screen_y - marker_half, 2, marker_half * 2);
             wb_display_fill_rectangle(display, screen_x - marker_half, screen_y - 1, marker_half * 2, 2);
         }
-    }
 
-    if (num_frontiers > 0) {
+        // highlight best frontier (index 0)
         int fx = frontiers[0].x;
         int fy = frontiers[0].y;
         if (fx >= grid_start_x && fx <= grid_end_x &&
             fy >= grid_start_y && fy <= grid_end_y) {
-
             int screen_x = (int)((fx - grid_start_x) * scale);
             int screen_y = DISPLAY_HEIGHT - (int)((fy - grid_start_y + 1) * scale);
-
             wb_display_set_color(display, 0xFFFF00);
-            int thick = 2;
-            int size = 8;
+            int thick = 2, size = 8;
             wb_display_fill_rectangle(display, screen_x - thick, screen_y - size, thick*2, size*2);
             wb_display_fill_rectangle(display, screen_x - size, screen_y - thick, size*2, thick*2);
-
-            wb_display_set_color(display, 0xFFFF00);
-            int ring_diameter = 8;
-            int ring_x = screen_x - ring_diameter/2;
-            int ring_y = screen_y - ring_diameter/2;
-            
-            wb_display_draw_oval(display, ring_x, ring_y, ring_diameter, ring_diameter);
-            wb_display_draw_oval(display, ring_x-1, ring_y-1, ring_diameter+2, ring_diameter+2);
+            wb_display_draw_oval(display, screen_x - size/2, screen_y - size/2, size, size);
         }
     }
-    
+
+    // IR status (keeps existing layout but only sets font once globally)
     display_ir_status(frame_count);
 
+    // draw robot at center (single color calls)
     int center_x = DISPLAY_WIDTH / 2;
     int center_y = DISPLAY_HEIGHT / 2;
     int robot_size = (int)(scale * 6);
-    
     wb_display_set_color(display, COLOR_ROBOT);
-    wb_display_fill_rectangle(display, 
-                              center_x - robot_size/2, 
-                              center_y - robot_size/2, 
-                              robot_size, 
-                              robot_size);
-    
+    wb_display_fill_rectangle(display,
+                              center_x - robot_size/2,
+                              center_y - robot_size/2,
+                              robot_size, robot_size);
+
     const double* orientation = wb_supervisor_node_get_orientation(robot_node);
     double robot_theta = atan2(orientation[3], orientation[0]);
     int arrow_length = robot_size;
     int arrow_end_x = center_x + (int)(arrow_length * cos(robot_theta));
     int arrow_end_y = center_y - (int)(arrow_length * sin(robot_theta));
-    
     wb_display_set_color(display, 0xFFFF00);
     wb_display_draw_line(display, center_x, center_y, arrow_end_x, arrow_end_y);
 
+    // Info text (we set font once earlier)
     wb_display_set_color(display, 0xFFFFFF);
-    wb_display_set_font(display, "Arial", 12, 0);
     wb_display_draw_text(display, "A* Pathfinding + Frontiers", 6, 5);
 
     char info[256];
-    sprintf(info, "Pos: (%d,%d) Waypoint: %d/%d", 
-            robot_gx, robot_gy, current_waypoint, 
+    sprintf(info, "Pos: (%d,%d) Waypoint: %d/%d",
+            robot_gx, robot_gy, current_waypoint,
             current_path ? current_path->count : 0);
     wb_display_draw_text(display, info, 6, 20);
-    
-    sprintf(info, "Frontiers: %d", num_frontiers);
+
+    sprintf(info, "Frontiers: %d", (int)(num_frontiers));
     wb_display_draw_text(display, info, 6, 35);
 
+    // Legend (set color then text)
     int legend_x = DISPLAY_WIDTH - 110;
     int legend_y = 6;
     int box = 10;
-    
     wb_display_set_color(display, cost_to_color(FREE_COST));
     wb_display_fill_rectangle(display, legend_x, legend_y, box, box);
     wb_display_set_color(display, 0xFFFFFF);
@@ -1798,17 +1872,18 @@ void render_display_with_path(int frame_count) {
     wb_display_fill_rectangle(display, legend_x, legend_y + 28, box, box);
     wb_display_set_color(display, 0xFFFFFF);
     wb_display_draw_text(display, "unknown", legend_x + 14, legend_y + 37);
-    
+
     wb_display_set_color(display, 0xFFFF00);
     wb_display_fill_rectangle(display, legend_x, legend_y + 42, box, box);
     wb_display_set_color(display, 0xFFFFFF);
     wb_display_draw_text(display, "target", legend_x + 14, legend_y + 51);
-    
+
     wb_display_set_color(display, 0x00FF00);
     wb_display_fill_rectangle(display, legend_x, legend_y + 56, box, box);
     wb_display_set_color(display, 0xFFFFFF);
     wb_display_draw_text(display, "path", legend_x + 14, legend_y + 65);
 }
+
 
 
 
