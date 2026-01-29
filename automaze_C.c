@@ -1,11 +1,3 @@
-// File Name: automaze_C.c
-// Version: 1.6.1
-// Last Modified: 22.11.2025
-
-// Change Log:
-// Fixed the jerky motion due to mistuned PID translate, 20.11.2025
-// Fixed the memory leak issue in render display, 22.11.2025
-// Fixed the Cost map EDT and obstacle inflation, 22.11.2025
 
 #include <webots/robot.h>
 #include <webots/lidar.h>
@@ -13,12 +5,14 @@
 #include <webots/display.h>
 #include <webots/motor.h>
 #include <webots/distance_sensor.h>
+#include <webots/camera.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <webots/range_finder.h> 
 
 // ============== A* IMPLEMENTATION (from AStar.h/AStar.c) ==============
 typedef struct __ASNeighborList *ASNeighborList;
@@ -104,8 +98,11 @@ static inline Node NodeMake(VisitedNodes nodes, size_t index) {
 }
 
 static inline NodeRecord *NodeGetRecord(Node node) {
-    return node.nodes->nodeRecords + (node.index * (node.nodes->source->nodeSize + sizeof(NodeRecord)));
+    uint8_t *base = (uint8_t*)node.nodes->nodeRecords;
+    size_t stride = sizeof(NodeRecord) + node.nodes->source->nodeSize;
+    return (NodeRecord*)(base + node.index * stride);
 }
+
 
 static inline void *GetNodeKey(Node node) {
     return NodeGetRecord(node)->nodeKey;
@@ -197,10 +194,10 @@ static inline int NodeKeyCompare(Node node, void *nodeKey) {
 
 static inline Node GetNode(VisitedNodes nodes, void *nodeKey) {
     if (!nodeKey) return NodeNull;
-    
+
     size_t first = 0;
     if (nodes->nodeRecordsCount > 0) {
-        size_t last = nodes->nodeRecordsCount-1;
+        size_t last = nodes->nodeRecordsCount - 1;
         while (first <= last) {
             const size_t mid = (first + last) / 2;
             const int comp = NodeKeyCompare(NodeMake(nodes, nodes->nodeRecordsIndex[mid]), nodeKey);
@@ -215,30 +212,47 @@ static inline Node GetNode(VisitedNodes nodes, void *nodeKey) {
             }
         }
     }
-    
+
+    // Ensure capacity for a NEW node
     if (nodes->nodeRecordsCount == nodes->nodeRecordsCapacity) {
-        nodes->nodeRecordsCapacity = 1 + (nodes->nodeRecordsCapacity * 2);
-        nodes->nodeRecords = realloc(nodes->nodeRecords, nodes->nodeRecordsCapacity * (sizeof(NodeRecord) + nodes->source->nodeSize));
-        nodes->nodeRecordsIndex = realloc(nodes->nodeRecordsIndex, nodes->nodeRecordsCapacity * sizeof(size_t));
+        const size_t newCap = 1 + (nodes->nodeRecordsCapacity * 2);
+        void *newRecords = realloc(nodes->nodeRecords,
+            newCap * (sizeof(NodeRecord) + nodes->source->nodeSize));
+        size_t *newIndex = realloc(nodes->nodeRecordsIndex, newCap * sizeof(size_t));
+
+        if (!newRecords || !newIndex) {
+            // allocation failed: keep old pointers valid
+            free(newRecords);
+            free(newIndex);
+            return NodeNull;
+        }
+
+        nodes->nodeRecords = newRecords;
+        nodes->nodeRecordsIndex = newIndex;
+        nodes->nodeRecordsCapacity = newCap;
     }
-    
+
+    // Insert index into sorted index array
+    const size_t used = nodes->nodeRecordsCount;  // count BEFORE increment
+
+    if (first < used) {
+        memmove(&nodes->nodeRecordsIndex[first + 1],
+                &nodes->nodeRecordsIndex[first],
+                (used - first) * sizeof(size_t));
+    }
+
     Node node = NodeMake(nodes, nodes->nodeRecordsCount);
-    nodes->nodeRecordsCount++;
-    
-    // FIX: Use nodeRecordsCount instead of nodeRecordsCapacity for memmove
-    if (first < nodes->nodeRecordsCount - 1) {
-        memmove(&nodes->nodeRecordsIndex[first+1], 
-                &nodes->nodeRecordsIndex[first], 
-                (nodes->nodeRecordsCount - first - 1) * sizeof(size_t));
-    }
     nodes->nodeRecordsIndex[first] = node.index;
-    
+    nodes->nodeRecordsCount++;
+
+    // Write record
     NodeRecord *record = NodeGetRecord(node);
     memset(record, 0, sizeof(NodeRecord));
     memcpy(record->nodeKey, nodeKey, nodes->source->nodeSize);
-    
+
     return node;
 }
+
 
 
 
@@ -551,18 +565,18 @@ void *ASPathGetNode(ASPath path, size_t index) {
 #define NEARBY_RADIUS_INNER 5
 #define NEARBY_RADIUS_OUTER 15
 
-#define MAX_QUEUE 1000
-#define MIN_BLOB_SIZE 8
+#define MAX_QUEUE 10000
+#define MIN_BLOB_SIZE 5
 
 // Cost Map
-#define OBSTACLE_COST 200
-#define FREE_COST 1
+#define OBSTACLE_COST 300
+#define FREE_COST 0.5
 #define UNKNOWN_COST 30
 #define INFLATION_RADIUS 10
 
 // Frontiers
-#define MAX_FRONTIERS 100
-#define MIN_FRONTIER_SIZE 20
+#define MAX_FRONTIERS 50
+#define MIN_FRONTIER_SIZE 10
 #define MIN_FRONTIER_CLEARANCE 5
 #define FRONTIER_SAFETY_CHECK_RADIUS 5
 
@@ -573,9 +587,30 @@ void *ASPathGetNode(ASPath path, size_t index) {
 #define COLOR_ROBOT 0x0064FF
 #define COLOR_BACKGROUND 0x303030
 
+
+// --- simple "recently failed frontier" cache ---
+#define FAIL_CACHE_MAX 200
+#define FAIL_TTL_STEPS 800   
+// ~800*32ms ≈ 25s. Tune.
+
 // IR Safety Configuration
 #define IR_SAFETY_THRESHOLD 0.10  // Stop if any sensor detects obstacle closer than this (in meters)
 #define IR_CRITICAL_THRESHOLD 0.05  // Emergency stop threshold
+
+
+// PID Gain Values
+#define KP_ROTATE 2
+#define KI_ROTATE 0.0001 
+#define KD_ROTATE 0.001
+
+#define KP_TRANSLATE 0.05
+#define KD_TRANSLATE 0
+
+
+#define DRIVE_DIST_THRESH 5
+#define DRIVE_ANGLE_THRESH 0.4
+
+#define LIDAR_MAX_RANGE_FACTOR 1.8
 
 
 
@@ -626,6 +661,37 @@ typedef struct {
     double score;
 } FrontierCentroid;
 
+
+typedef enum {
+  COLOR_RED,
+  COLOR_GREEN,
+  COLOR_BLUE,
+  COLOR_YELLOW
+} TargetColor;
+
+typedef enum {
+  MARK_SQUARE,
+  MARK_DISK
+} MarkShape;
+
+typedef struct {
+  bool  valid;
+  float cx;      // centroid x in pixels
+  float cy;      // centroid y in pixels
+  int   count;   // number of matching pixels
+} Centroid2D;
+
+typedef struct {
+  bool  valid;
+  float dist;    // depth/range at centroid (meters)
+} DepthAtCentroid;
+
+typedef struct {
+  bool  valid;
+  int   gx;
+  int   gy;
+} GridHit;
+
 // Global variables
 static unsigned int grid[GRID_SIZE][GRID_SIZE];
 static unsigned int obstacle_counter[GRID_SIZE][GRID_SIZE];
@@ -636,12 +702,8 @@ static WbDeviceTag display;
 static WbDeviceTag lidar;
 static WbDeviceTag motors[4];
 static WbNodeRef robot_node;
-
-
-static FrontierCentroid frontiers[MAX_FRONTIERS];
-static int num_frontiers = 0;
-static double frontier_min_score = 0.0;
-static double frontier_max_score = 1.0;
+static WbDeviceTag camera_rgb;
+static WbDeviceTag camera_depth;
 
 static WbDeviceTag ir_sensors[4];
 static const char* ir_sensor_names[4] = {
@@ -659,6 +721,23 @@ static double pid_rotate_integral = 0.0;
 static double pid_rotate_prev_error = 0.0;
 static double pid_translate_integral = 0.0;
 static double pid_translate_prev_error = 0.0;
+
+
+
+static int scan_ticks = 0;           // countdown in simulation steps
+static double scan_speed = 0.5;      // wheel rad/s (tune)
+
+
+typedef struct {
+  int x, y;
+  int expire_frame;
+} FailedFrontier;
+
+static FailedFrontier failed_frontiers[FAIL_CACHE_MAX];
+static int failed_frontiers_count = 0;
+
+
+
 
 // ============ INITIALIZATION ===============
 
@@ -733,12 +812,6 @@ void world_to_grid(double wx, double wy, int* gx, int* gy) {
     *gy = (int)((wy / GRID_RESOLUTION) + GRID_SIZE / 2);
 }
 
-void grid_to_world(int gx, int gy, double* wx, double* wy) {
-    *wx = ((double)gx - GRID_SIZE / 2) * GRID_RESOLUTION;
-    *wy = ((double)gy - GRID_SIZE / 2) * GRID_RESOLUTION;
-}
-
-
 int is_valid_cell(int x, int y) {
     return x >= 0 && x < GRID_SIZE && y >= 0 && y < GRID_SIZE;
 }
@@ -752,6 +825,42 @@ double clamp(double val, double min, double max) {
 double normalize_angle(double angle) {
     return atan2(sin(angle), cos(angle));
 }
+
+
+static bool is_failed_frontier(int x, int y, int frame_count) {
+  for (int i = 0; i < failed_frontiers_count; i++) {
+    if (failed_frontiers[i].expire_frame <= frame_count) continue;
+    if (failed_frontiers[i].x == x && failed_frontiers[i].y == y) return true;
+  }
+  return false;
+}
+
+static void mark_failed_frontier(int x, int y, int frame_count) {
+  // reuse expired slot if possible
+  for (int i = 0; i < failed_frontiers_count; i++) {
+    if (failed_frontiers[i].expire_frame <= frame_count) {
+      failed_frontiers[i] = (FailedFrontier){x, y, frame_count + FAIL_TTL_STEPS};
+      return;
+    }
+  }
+
+  if (failed_frontiers_count < FAIL_CACHE_MAX) {
+    failed_frontiers[failed_frontiers_count++] =
+        (FailedFrontier){x, y, frame_count + FAIL_TTL_STEPS};
+  } else {
+    // overwrite oldest-ish (simple strategy: slot 0)
+    failed_frontiers[0] = (FailedFrontier){x, y, frame_count + FAIL_TTL_STEPS};
+  }
+}
+
+
+
+
+
+
+
+
+
 
 // ============== A* PATHFINDING CALLBACKS ==============
 
@@ -804,7 +913,7 @@ int grid_node_comparator(void *node1, void *node2, void *context) {
 }
 
 int grid_early_exit(size_t visitedCount, void *visitingNode, void *goalNode, void *context) {
-    if (visitedCount > 10000) {
+    if (visitedCount > 150000) { // or even 150K
         return -1;
     }
     return 0;
@@ -874,12 +983,65 @@ void destroy_grid_path(GridPath* path) {
     }
 }
 
+void smooth_path(GridPath* path) {
+    if (!path || path->count < 3) return;
+    
+    int write_idx = 1;
+    
+    for (int i = 1; i < path->count - 1; i++) {
+        GridNode* prev = &path->nodes[write_idx - 1];
+        GridNode* next = &path->nodes[i + 1];
+        
+        bool has_los = true;
+        
+        int dx = abs(next->x - prev->x);
+        int dy = abs(next->y - prev->y);
+        int sx = prev->x < next->x ? 1 : -1;
+        int sy = prev->y < next->y ? 1 : -1;
+        int err = dx - dy;
+        int x = prev->x, y = prev->y;
+        
+        while (x != next->x || y != next->y) {
+            if (!is_valid_cell(x, y) || grid[y][x] == CELL_OBSTACLE) {
+                has_los = false;
+                break;
+            }
+            
+            int e2 = 2 * err;
+            if (e2 > -dy) { err -= dy; x += sx; }
+            if (e2 < dx) { err += dx; y += sy; }
+        }
+        
+        if (!has_los) {
+            path->nodes[write_idx++] = path->nodes[i];
+        }
+    }
+    
+    path->nodes[write_idx++] = path->nodes[path->count - 1];
+    path->count = write_idx;
+}
 
 // =============== ROBOT CONTROL ===============
-double pid_rotate(double angle_error) {
-    static double Kp_rotate = 1.0;  
-    static double Ki_rotate = 0.0;  
-    static double Kd_rotate = 0.0;  
+
+double current_smooth_speed = 0;
+
+
+double apply_slew_limiter(double target_speed, double max_accel, double dt) {
+    double max_change = max_accel * dt;
+    double speed_diff = target_speed - current_smooth_speed;
+
+    // Constrain the change to the maximum allowed step
+    if (speed_diff > max_change) {
+        speed_diff = max_change;
+    } else if (speed_diff < -max_change) {
+        speed_diff = -max_change;
+    }
+
+    current_smooth_speed += speed_diff;
+    return current_smooth_speed;
+}
+
+double pid_rotate(double angle_error) { 
     
     double integral_limit = 1.0;  
     pid_rotate_integral += angle_error * (TIME_STEP / 1000.0);
@@ -888,19 +1050,17 @@ double pid_rotate(double angle_error) {
     double derivative = (angle_error - pid_rotate_prev_error) / (TIME_STEP / 1000.0);
     pid_rotate_prev_error = angle_error;
     
-    double omega = Kp_rotate * angle_error + Ki_rotate * pid_rotate_integral + Kd_rotate * derivative;
+    double omega = KP_ROTATE * angle_error + KI_ROTATE * pid_rotate_integral + KD_ROTATE * derivative;
     
     return omega;
 }
 
 double pid_translate(double distance_error) {
-    static double Kp_translate = 0.02;  
-    static double Kd_translate = 0.0;  
     
     double derivative = (distance_error - pid_translate_prev_error) / (TIME_STEP / 1000.0);
     pid_translate_prev_error = distance_error;
     
-    double speed = Kp_translate * distance_error + Kd_translate * derivative;
+    double speed = KP_TRANSLATE * distance_error + KD_TRANSLATE * derivative;
     
     return clamp(speed, 0, 2.0);
 }
@@ -927,10 +1087,10 @@ double rotate_drive(double rotations, double angle_threshold, double b, double r
     // --- stop condition ---
     if (fabs(angle_diff) < angle_threshold) {
         // Stop motors
-        wb_motor_set_velocity(motors[0], 0);
-        wb_motor_set_velocity(motors[1], 0);
-        wb_motor_set_velocity(motors[2], 0);
-        wb_motor_set_velocity(motors[3], 0);
+        //wb_motor_set_velocity(motors[0], 0);
+        //wb_motor_set_velocity(motors[1], 0);
+        //wb_motor_set_velocity(motors[2], 0);
+        //wb_motor_set_velocity(motors[3], 0);
 
         return 1.0; // success
     }
@@ -1005,13 +1165,40 @@ bool diff_drive(int x_goal, int y_goal, double distance_threshold,
     
     double omega, speed;
     
-    if (fabs(angle_diff) > angle_threshold) {
-        omega = pid_rotate(angle_diff);
+        // --- Angle hysteresis to prevent chattering ---
+    static bool turn_in_place = true;   // start by turning until aligned
+    const double ANG_HI = angle_threshold;        // enter/keep turn-in-place
+    const double ANG_LO = angle_threshold * 0.6;  // exit turn-in-place (smaller)
+
+    // state transitions
+    if (turn_in_place) {
+        if (fabs(angle_diff) < ANG_LO) {
+            turn_in_place = false;
+            // switching to translate: avoid PID "kick"
+            pid_rotate_integral = 0.0;
+            pid_rotate_prev_error = angle_diff;
+            pid_translate_prev_error = distance;
+            current_smooth_speed = 0.0; // reset slew state
+        }
+    } else {
+        if (fabs(angle_diff) > ANG_HI) {
+            turn_in_place = true;
+            // switching to rotate: stop translation smoothly
+            pid_translate_prev_error = distance;
+            current_smooth_speed = 0.0;
+        }
+    }
+
+    // commands
+    omega = pid_rotate(angle_diff);
+
+    if (turn_in_place) {
         speed = 0.0;
     } else {
-        omega = pid_rotate(angle_diff);
-        speed = pid_translate(distance);
+        double v_cmd = pid_translate(distance);
+        speed = apply_slew_limiter(v_cmd, 0.8, TIME_STEP / 1000.0);
     }
+
     
     // Apply IR safety speed reduction
     if (ir_safety_triggered && min_ir_distance < IR_SAFETY_THRESHOLD) {
@@ -1035,6 +1222,36 @@ bool diff_drive(int x_goal, int y_goal, double distance_threshold,
 }
 
 
+static void do_scan_spin() {
+  // spin in place (left wheels backward, right wheels forward)
+  wb_motor_set_velocity(motors[0], -scan_speed);
+  wb_motor_set_velocity(motors[1], -scan_speed);
+  wb_motor_set_velocity(motors[2],  scan_speed);
+  wb_motor_set_velocity(motors[3],  scan_speed);
+}
+
+
+static double prev_theta = 0.0;
+static bool theta_init = false;
+
+static bool should_integrate_lidar(double robot_theta) {
+  if (!theta_init) { prev_theta = robot_theta; theta_init = true; return true; }
+  double dt = TIME_STEP / 1000.0;
+  double dtheta = normalize_angle(robot_theta - prev_theta);
+  prev_theta = robot_theta;
+  double yaw_rate = fabs(dtheta) / dt;
+  return yaw_rate < 0.6;  // rad/s threshold (tune 0.4..0.8)
+}
+
+
+
+
+
+
+
+
+
+
 
 
 bool follow_path() {
@@ -1042,37 +1259,18 @@ bool follow_path() {
         return false;
     }
     
-    // Track if we're making progress
-    static int stuck_counter = 0;
-    static int last_waypoint = -1;
-    
-    if (current_waypoint == last_waypoint) {
-        stuck_counter++;
-        if (stuck_counter > 50) { // Stuck for 50 frames
-            printf("Path following stuck, replanning...\n");
-            destroy_grid_path(current_path);
-            current_path = NULL;
-            stuck_counter = 0;
-            last_waypoint = -1;
-            return true; // Force replan
-        }
-    } else {
-        stuck_counter = 0;
-        last_waypoint = current_waypoint;
-    }
-    
-    // Rest of the path following logic...
+    // Skip waypoints that are too close together
     const double* position = wb_supervisor_node_get_position(robot_node);
     int robot_gx, robot_gy;
     world_to_grid(position[0], position[1], &robot_gx, &robot_gy);
     
-    // Skip close waypoints
     while (current_waypoint < current_path->count - 1) {
         GridNode* next_wp = &current_path->nodes[current_waypoint];
         double dx = next_wp->x - robot_gx;
         double dy = next_wp->y - robot_gy;
         double dist = sqrt(dx * dx + dy * dy);
         
+        // Skip if waypoint is very close
         if (dist < 10.0) {
             current_waypoint++;
             reset_pid_controllers();
@@ -1085,7 +1283,7 @@ bool follow_path() {
     
     bool reached = diff_drive(
         waypoint->x, waypoint->y,
-        10.0, 1.0,
+        DRIVE_DIST_THRESH, DRIVE_ANGLE_THRESH, // dist thresh., angle thresh.
         0.287, 0.0825
     );
     
@@ -1101,10 +1299,6 @@ bool follow_path() {
     
     return false;
 }
-
-
-
-
 
 // =============== MAPPING AND PERCEPTION ===============
 
@@ -1227,7 +1421,7 @@ void process_lidar() {
     const float* ranges = wb_lidar_get_range_image(lidar);
     int resolution = wb_lidar_get_horizontal_resolution(lidar);
     double fov = wb_lidar_get_fov(lidar);
-    double max_range = wb_lidar_get_max_range(lidar);
+    double max_range = LIDAR_MAX_RANGE_FACTOR; // wb_lidar_get_max_range(lidar) * 
     
     for (int i = 0; i < resolution; i += 2) {
         double range = ranges[i];
@@ -1272,19 +1466,6 @@ void decay_counters() {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-#include <math.h>
 
 inline void relax(double dist_transform[GRID_SIZE][GRID_SIZE],
                   int x, int y, int nx, int ny, double cost)
@@ -1376,16 +1557,6 @@ void generate_cost_map(void) {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
 
 // =============== FRONTIER EXPLORATION ===============
 
@@ -1540,48 +1711,54 @@ FrontierCentroid* get_best_frontier(FrontierCentroid* frontiers, int num_frontie
     return (num_frontiers > 0) ? &frontiers[0] : NULL;
 }
 
-void update_path_to_frontier() {
+void update_path_to_frontier(int frame_count) {
     static FrontierCentroid frontiers[MAX_FRONTIERS];
     int num_frontiers = find_frontier_centroids(frontiers, MAX_FRONTIERS);
-    
+
     if (num_frontiers == 0) {
         printf("No frontiers found - exploration complete!\n");
         return;
     }
-    
-    FrontierCentroid* best_frontier = get_best_frontier(frontiers, num_frontiers);
-    if (!best_frontier) {
-        return;
-    }
-    
+
     const double* position = wb_supervisor_node_get_position(robot_node);
     int robot_gx, robot_gy;
     world_to_grid(position[0], position[1], &robot_gx, &robot_gy);
-    
+
     if (current_path) {
         destroy_grid_path(current_path);
         current_path = NULL;
     }
-    
-    printf("Planning path to frontier at (%d, %d) with score %.2f\n", 
-           best_frontier->x, best_frontier->y, best_frontier->score);
-    
-    current_path = find_path_astar(robot_gx, robot_gy, 
-                                   best_frontier->x, best_frontier->y);
-    current_waypoint = 0;
-    
-    if (!current_path) {
-        printf("Failed to find path to frontier\n");
+
+    // Try best-to-worse until we find a reachable one
+    for (int i = 0; i < num_frontiers; i++) {
+        FrontierCentroid *f = &frontiers[i];
+
+        // skip recently failed frontiers
+        if (is_failed_frontier(f->x, f->y, frame_count)) {
+            continue;
+        }
+
+        printf("Planning path to frontier #%d at (%d,%d) score=%.2f size=%d\n",
+               i, f->x, f->y, f->score, f->size);
+
+        GridPath* p = find_path_astar(robot_gx, robot_gy, f->x, f->y);
+
+        if (p) {
+            current_path = p;
+            current_waypoint = 0;
+            printf("Selected frontier #%d (reachable)\n", i);
+            return;
+        }
+
+        // mark failed so we don't keep retrying it every update cycle
+        printf("Frontier #%d unreachable -> trying next\n", i);
+        mark_failed_frontier(f->x, f->y, frame_count);
     }
+
+    // If we reach here: none reachable right now
+    printf("All %d frontiers unreachable right now. Spinning to discover openings...\n", num_frontiers);
+    scan_ticks = (int)(1.0 / (TIME_STEP / 1000.0)); // ~1s scan
 }
-
-
-
-
-
-
-
-
 
 
 // =============== DISPLAY RENDERING ===============
@@ -1702,8 +1879,7 @@ void display_ir_status(int frame_count) {
         wb_display_fill_rectangle(display, status_x - 2, status_y - 2, 180, 55);
     }
     
-    wb_display_set_color(display, 0xFFFFFF);
-    wb_display_set_font(display, "Arial", 10, 0);
+    
     wb_display_draw_text(display, "IR Sensors:", status_x, status_y);
     
     for (int i = 0; i < 4; i++) {
@@ -1732,28 +1908,7 @@ void display_ir_status(int frame_count) {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 void render_display_with_path(int frame_count) {
-    // Lazy one-time font initialization to avoid repeated font allocations
-    static bool font_initialized = false;
-    if (!font_initialized) {
-        wb_display_set_font(display, "Arial", 12, 0);
-        font_initialized = true;
-    }
-
-    // Clear background
     wb_display_set_color(display, COLOR_BACKGROUND);
     wb_display_fill_rectangle(display, 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 
@@ -1773,153 +1928,135 @@ void render_display_with_path(int frame_count) {
     int grid_start_y = robot_gy - half_viewport;
     int grid_end_y = robot_gy + half_viewport;
 
-    // Draw visible cells. Minimize set_color calls by tracking last_color.
-    unsigned int last_color = 0xFFFFFFFF; // impossible to match
     for (int gy = grid_start_y; gy <= grid_end_y; gy++) {
         for (int gx = grid_start_x; gx <= grid_end_x; gx++) {
             if (!is_valid_cell(gx, gy)) continue;
 
-            unsigned int color;
-            unsigned int cell = grid[gy][gx];
+            unsigned int color = COLOR_UNKNOWN;
 
-            if (cell == CELL_UNKNOWN) {
-                continue; // skip unknown for performance
-            } else if (cell == CELL_OBSTACLE) {
+            if (grid[gy][gx] == CELL_UNKNOWN) {
+                color = COLOR_UNKNOWN;
+            } else if (grid[gy][gx] == CELL_OBSTACLE) {
                 color = COLOR_OBSTACLE;
-            } else if (cell == CELL_ROBOT) {
-                continue; // robot rendered later at center
-            } else { // free or others
+            } else if (grid[gy][gx] == CELL_ROBOT) {
+                continue;
+            } else {
                 double c = cost_map[gy][gx];
                 color = cost_to_color(c);
             }
 
-            if (color != last_color) {
-                wb_display_set_color(display, color);
-                last_color = color;
-            }
-
             int screen_x = (int)((gx - grid_start_x) * scale);
             int screen_y = DISPLAY_HEIGHT - (int)((gy - grid_start_y + 1) * scale);
-            wb_display_fill_rectangle(display, screen_x, screen_y, cell_size, cell_size);
-        }
-    }
 
-    // Draw path (cheap early-out)
-    if (current_path && current_path->count > 0) {
-        // set color once for path lines
-        wb_display_set_color(display, 0x00FF00);
-        for (int i = 0; i < current_path->count - 1; ++i) {
-            GridNode* n1 = &current_path->nodes[i];
-            GridNode* n2 = &current_path->nodes[i + 1];
-            int x1 = (int)((n1->x - grid_start_x) * scale);
-            int y1 = DISPLAY_HEIGHT - (int)((n1->y - grid_start_y + 1) * scale);
-            int x2 = (int)((n2->x - grid_start_x) * scale);
-            int y2 = DISPLAY_HEIGHT - (int)((n2->y - grid_start_y + 1) * scale);
-            wb_display_draw_line(display, x1, y1, x2, y2);
-        }
-
-        // draw nodes (reuse a single color change)
-        wb_display_set_color(display, 0x0000FF);
-        for (int i = 0; i < current_path->count; ++i) {
-            GridNode* n = &current_path->nodes[i];
-            int x = (int)((n->x - grid_start_x) * scale);
-            int y = DISPLAY_HEIGHT - (int)((n->y - grid_start_y + 1) * scale);
-            if (i == current_waypoint) {
-                wb_display_set_color(display, 0xFF00FF);
-                wb_display_fill_oval(display, x - 3, y - 3, 6, 6);
-                wb_display_set_color(display, 0x0000FF); // restore
-            } else {
-                wb_display_draw_oval(display, x - 2, y - 2, 4, 4);
+            if (grid[gy][gx] != CELL_UNKNOWN) {
+                wb_display_set_color(display, color);
+                wb_display_fill_rectangle(display, screen_x, screen_y, cell_size, cell_size);
             }
         }
     }
 
-    // Frontiers: update every N calls (keeps same behaviour).
+    draw_path_on_display(display, current_path, robot_gx, robot_gy, 
+                        scale, grid_start_x, grid_start_y);
+
     static FrontierCentroid frontiers[MAX_FRONTIERS];
     static int num_frontiers = 0;
     static int frontier_update_counter = 0;
+    
     if (++frontier_update_counter >= 20) {
         frontier_update_counter = 0;
         num_frontiers = find_frontier_centroids(frontiers, MAX_FRONTIERS);
     }
 
-    if (num_frontiers > 0) {
-        double min_score = 1e9, max_score = -1e9;
-        for (int i = 0; i < num_frontiers; ++i) {
-            if (frontiers[i].score < min_score) min_score = frontiers[i].score;
-            if (frontiers[i].score > max_score) max_score = frontiers[i].score;
-        }
-        if (min_score == 1e9) { min_score = 0.0; max_score = 1.0; }
+    double min_score = 1e9, max_score = -1e9;
+    for (int i = 0; i < num_frontiers; i++) {
+        if (frontiers[i].score < min_score) min_score = frontiers[i].score;
+        if (frontiers[i].score > max_score) max_score = frontiers[i].score;
+    }
+    if (min_score == 1e9) { min_score = 0.0; max_score = 1.0; }
 
-        // draw frontier markers
-        for (int i = 0; i < num_frontiers; ++i) {
-            int fx = frontiers[i].x;
-            int fy = frontiers[i].y;
-            if (fx < grid_start_x || fx > grid_end_x || fy < grid_start_y || fy > grid_end_y) continue;
-
+    for (int i = 0; i < num_frontiers; i++) {
+        int fx = frontiers[i].x;
+        int fy = frontiers[i].y;
+        
+        if (fx >= grid_start_x && fx <= grid_end_x &&
+            fy >= grid_start_y && fy <= grid_end_y) {
+            
             int screen_x = (int)((fx - grid_start_x) * scale);
             int screen_y = DISPLAY_HEIGHT - (int)((fy - grid_start_y + 1) * scale);
-
+            
             unsigned int fcolor = frontier_score_to_color(frontiers[i].score, min_score, max_score);
             wb_display_set_color(display, fcolor);
+
             int marker_half = 6;
             wb_display_fill_rectangle(display, screen_x - 1, screen_y - marker_half, 2, marker_half * 2);
             wb_display_fill_rectangle(display, screen_x - marker_half, screen_y - 1, marker_half * 2, 2);
         }
+    }
 
-        // highlight best frontier (index 0)
+    if (num_frontiers > 0) {
         int fx = frontiers[0].x;
         int fy = frontiers[0].y;
         if (fx >= grid_start_x && fx <= grid_end_x &&
             fy >= grid_start_y && fy <= grid_end_y) {
+
             int screen_x = (int)((fx - grid_start_x) * scale);
             int screen_y = DISPLAY_HEIGHT - (int)((fy - grid_start_y + 1) * scale);
+
             wb_display_set_color(display, 0xFFFF00);
-            int thick = 2, size = 8;
+            int thick = 2;
+            int size = 8;
             wb_display_fill_rectangle(display, screen_x - thick, screen_y - size, thick*2, size*2);
             wb_display_fill_rectangle(display, screen_x - size, screen_y - thick, size*2, thick*2);
-            wb_display_draw_oval(display, screen_x - size/2, screen_y - size/2, size, size);
+
+            wb_display_set_color(display, 0xFFFF00);
+            int ring_diameter = 8;
+            int ring_x = screen_x - ring_diameter/2;
+            int ring_y = screen_y - ring_diameter/2;
+            
+            wb_display_draw_oval(display, ring_x, ring_y, ring_diameter, ring_diameter);
+            wb_display_draw_oval(display, ring_x-1, ring_y-1, ring_diameter+2, ring_diameter+2);
         }
     }
-
-    // IR status (keeps existing layout but only sets font once globally)
+    
     display_ir_status(frame_count);
 
-    // draw robot at center (single color calls)
     int center_x = DISPLAY_WIDTH / 2;
     int center_y = DISPLAY_HEIGHT / 2;
     int robot_size = (int)(scale * 6);
+    
     wb_display_set_color(display, COLOR_ROBOT);
-    wb_display_fill_rectangle(display,
-                              center_x - robot_size/2,
-                              center_y - robot_size/2,
-                              robot_size, robot_size);
-
+    wb_display_fill_rectangle(display, 
+                              center_x - robot_size/2, 
+                              center_y - robot_size/2, 
+                              robot_size, 
+                              robot_size);
+    
     const double* orientation = wb_supervisor_node_get_orientation(robot_node);
     double robot_theta = atan2(orientation[3], orientation[0]);
     int arrow_length = robot_size;
     int arrow_end_x = center_x + (int)(arrow_length * cos(robot_theta));
     int arrow_end_y = center_y - (int)(arrow_length * sin(robot_theta));
+    
     wb_display_set_color(display, 0xFFFF00);
     wb_display_draw_line(display, center_x, center_y, arrow_end_x, arrow_end_y);
 
-    // Info text (we set font once earlier)
     wb_display_set_color(display, 0xFFFFFF);
+    wb_display_set_font(display, "Arial", 12, 0);
     wb_display_draw_text(display, "A* Pathfinding + Frontiers", 6, 5);
 
     char info[256];
-    sprintf(info, "Pos: (%d,%d) Waypoint: %d/%d",
-            robot_gx, robot_gy, current_waypoint,
+    sprintf(info, "Pos: (%d,%d) Waypoint: %d/%d", 
+            robot_gx, robot_gy, current_waypoint, 
             current_path ? current_path->count : 0);
     wb_display_draw_text(display, info, 6, 20);
-
-    sprintf(info, "Frontiers: %d", (int)(num_frontiers));
+    
+    sprintf(info, "Frontiers: %d", num_frontiers);
     wb_display_draw_text(display, info, 6, 35);
 
-    // Legend (set color then text)
     int legend_x = DISPLAY_WIDTH - 110;
     int legend_y = 6;
     int box = 10;
+    
     wb_display_set_color(display, cost_to_color(FREE_COST));
     wb_display_fill_rectangle(display, legend_x, legend_y, box, box);
     wb_display_set_color(display, 0xFFFFFF);
@@ -1934,12 +2071,12 @@ void render_display_with_path(int frame_count) {
     wb_display_fill_rectangle(display, legend_x, legend_y + 28, box, box);
     wb_display_set_color(display, 0xFFFFFF);
     wb_display_draw_text(display, "unknown", legend_x + 14, legend_y + 37);
-
+    
     wb_display_set_color(display, 0xFFFF00);
     wb_display_fill_rectangle(display, legend_x, legend_y + 42, box, box);
     wb_display_set_color(display, 0xFFFFFF);
     wb_display_draw_text(display, "target", legend_x + 14, legend_y + 51);
-
+    
     wb_display_set_color(display, 0x00FF00);
     wb_display_fill_rectangle(display, legend_x, legend_y + 56, box, box);
     wb_display_set_color(display, 0xFFFFFF);
@@ -1956,13 +2093,208 @@ void render_display_with_path(int frame_count) {
 
 
 
+// ============ CAMERA FUNCTIONS ================
 
 
+static inline int clampi(int v, int lo, int hi) {
+  return (v < lo) ? lo : (v > hi) ? hi : v;
+}
 
+static inline bool is_finite_float(float x) {
+  return isfinite((double)x);
+}
 
+static inline bool color_match(TargetColor c, int r, int g, int b) {
+  // Basic "colorfulness" filter (reject gray/white-ish pixels)
+  int maxv = r; if (g > maxv) maxv = g; if (b > maxv) maxv = b;
+  int minv = r; if (g < minv) minv = g; if (b < minv) minv = b;
+  if ((maxv - minv) < 40) return false;
 
+  // Thresholds (tune if needed)
+  switch (c) {
+    case COLOR_BLUE:   return (b > 120 && r < 70  && g < 90);
+    case COLOR_YELLOW: return (r > 120 && g > 120 && b < 90);
+    case COLOR_RED:    return (r > 150 && g < 60  && b < 60); 
+    case COLOR_GREEN:  return (g > 80 && r < 60  && b < 60);
+    default: return false;
+  }
+}
 
+static Centroid2D find_color_centroid(WbDeviceTag cam, TargetColor target,
+                                     int min_pixels, int step) {
+  Centroid2D out = {0};
+  if (!cam) return out;
 
+  int w = wb_camera_get_width(cam);
+  int h = wb_camera_get_height(cam);
+  const unsigned char *img = wb_camera_get_image(cam);
+  if (!img || w <= 0 || h <= 0) return out;
+
+  long long sumx = 0, sumy = 0;
+  int count = 0;
+
+  // step=1 full res, step=2 faster, etc.
+  for (int y = 0; y < h; y += step) {
+    for (int x = 0; x < w; x += step) {
+      int r = wb_camera_image_get_red(img,  w, x, y);
+      int g = wb_camera_image_get_green(img,w, x, y);
+      int b = wb_camera_image_get_blue(img, w, x, y);
+
+      if (color_match(target, r, g, b)) {
+        sumx += x;
+        sumy += y;
+        count++;
+      }
+    }
+  }
+
+  out.count = count;
+  if (count < min_pixels) return out;
+
+  out.valid = true;
+  out.cx = (float)sumx / (float)count;
+  out.cy = (float)sumy / (float)count;
+  return out;
+}
+
+static float median9(float *a, int n) {
+  // n <= 9, simple insertion sort
+  for (int i = 1; i < n; i++) {
+    float v = a[i];
+    int j = i - 1;
+    while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; }
+    a[j + 1] = v;
+  }
+  return a[n / 2];
+}
+
+static DepthAtCentroid depth_at_centroid(WbDeviceTag rf, float cx, float cy) {
+  DepthAtCentroid out = {0};
+  if (!rf) return out;
+
+  int w = wb_range_finder_get_width(rf);
+  int h = wb_range_finder_get_height(rf);
+  const float *range = wb_range_finder_get_range_image(rf);
+  if (!range || w <= 0 || h <= 0) return out;
+
+  int x0 = (int)lroundf(cx);
+  int y0 = (int)lroundf(cy);
+
+  // Take a small window around centroid and median it (robust against noise)
+  float vals[9];
+  int n = 0;
+
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+      int x = clampi(x0 + dx, 0, w - 1);
+      int y = clampi(y0 + dy, 0, h - 1);
+      float d = range[y * w + x];
+      if (is_finite_float(d) && d > 0.001f && d < 1000.0f) {
+        vals[n++] = d;
+      }
+    }
+  }
+
+  if (n == 0) return out;
+
+  out.valid = true;
+  out.dist = median9(vals, n);
+  return out;
+}
+
+static void mark_obstacle_disk(int gx, int gy, int radius_cells) {
+  int r2 = radius_cells * radius_cells;
+  for (int dy = -radius_cells; dy <= radius_cells; dy++) {
+    for (int dx = -radius_cells; dx <= radius_cells; dx++) {
+      if (dx*dx + dy*dy > r2) continue;
+      int x = gx + dx;
+      int y = gy + dy;
+      if (!is_valid_cell(x, y)) continue;
+      if (grid[y][x] == CELL_ROBOT) continue;
+
+      // Force obstacle only
+      grid[y][x] = CELL_OBSTACLE;
+      obstacle_counter[y][x] = OBSTACLE_THRESHOLD; // “lock in” quickly
+      free_counter[y][x] = 0;
+    }
+  }
+}
+
+static void mark_obstacle_square(int gx, int gy, int half_size_cells) {
+  for (int dy = -half_size_cells; dy <= half_size_cells; dy++) {
+    for (int dx = -half_size_cells; dx <= half_size_cells; dx++) {
+      int x = gx + dx;
+      int y = gy + dy;
+      if (!is_valid_cell(x, y)) continue;
+      if (grid[y][x] == CELL_ROBOT) continue;
+
+      grid[y][x] = CELL_OBSTACLE;
+      obstacle_counter[y][x] = OBSTACLE_THRESHOLD;
+      free_counter[y][x] = 0;
+    }
+  }
+}
+
+// Main function you call from loop
+bool detect_color_and_mark_on_grid(
+  WbDeviceTag cam_rgb,
+  WbDeviceTag rf_depth,
+  TargetColor target,
+  int min_pixels,
+  MarkShape shape,
+  int mark_radius_cells,
+  double fov_horizontal,
+  double distance_scale,       // e.g. 0.85 (mark slightly closer than measured)
+  WbNodeRef robot
+) {
+  if (!cam_rgb || !rf_depth || !robot) return false;
+
+  // 1) centroid in image
+  // step=2 is a good default speed/quality tradeoff
+  Centroid2D cen = find_color_centroid(cam_rgb, target, min_pixels, 2);
+  if (!cen.valid) return false;
+
+  // 2) depth at centroid
+  DepthAtCentroid dep = depth_at_centroid(rf_depth, cen.cx, cen.cy);
+  if (!dep.valid) return false;
+
+  // 3) compute bearing from centroid x
+  int w = wb_camera_get_width(cam_rgb);
+  float bearing = -(float)((cen.cx - 0.5f * (float)w) * ((float)fov_horizontal / (float)w));
+
+  // 4) robot pose
+  const double *pos = wb_supervisor_node_get_position(robot);
+  const double *ori = wb_supervisor_node_get_orientation(robot);
+  double robot_x = pos[0];
+  double robot_y = pos[1];
+  double theta   = atan2(ori[3], ori[0]);
+
+  // 5) project to world (planar assumption)
+  double d = (double)dep.dist * distance_scale;
+
+  double world_ang = theta + (double)bearing;
+  
+  double wx = robot_x + d * cos(world_ang);
+  double wy = robot_y + d * sin(world_ang);
+
+  // 6) world -> grid
+  int gx, gy;
+  world_to_grid(wx, wy, &gx, &gy);
+  if (!is_valid_cell(gx, gy)) return false;
+
+  // 7) mark as obstacle (only)
+  if (shape == MARK_DISK) {
+    mark_obstacle_disk(gx, gy, mark_radius_cells);
+  } else {
+    mark_obstacle_square(gx, gy, mark_radius_cells);
+  }
+
+  // Optional: debug print
+  // printf("[COLOR] target=%d cen=(%.1f,%.1f) depth=%.2f -> grid=(%d,%d)\n",
+  //        target, cen.cx, cen.cy, dep.dist, gx, gy);
+
+  return true;
+}
 
 
 
@@ -1984,11 +2316,20 @@ int main(int argc, char **argv) {
     
     robot_node = wb_supervisor_node_get_self();
     
+    camera_rgb = wb_robot_get_device("camera rgb");
+    if (camera_rgb) wb_camera_enable(camera_rgb, TIME_STEP);
+    
+    camera_depth = wb_robot_get_device("camera depth");   // <-- use your device name
+    if (camera_depth) wb_range_finder_enable(camera_depth, TIME_STEP);
+    
     display = wb_robot_get_device("display");
     if (!display) {
         printf("Error: No display device found!\n");
         return 1;
     }
+    
+    wb_display_set_color(display, 0xFFFFFF);
+    wb_display_set_font(display, "Arial", 10, 0);
     
     lidar = wb_robot_get_device("laser");
     if (!lidar) {
@@ -2005,7 +2346,7 @@ int main(int argc, char **argv) {
     int frame_count = 0;
     
     
-    rotate_drive(2, 0.3, 0.287, 0.0825);
+    //rotate_drive(2, 0.3, 0.287, 0.0825);
     
     
     
@@ -2017,12 +2358,17 @@ int main(int argc, char **argv) {
     
     while (wb_robot_step(TIME_STEP) != -1) {
         frame_count++;
+        const double* orientation = wb_supervisor_node_get_orientation(robot_node);
+        double robot_theta = atan2(orientation[3], orientation[0]);
+
+        if (should_integrate_lidar(robot_theta)) {
+          process_lidar();
+        } else {
+          decay_counters();
+        }
+       
         
-        
-        
-        process_lidar();
-        
-        if (frame_count % 10 == 0) {
+        if (frame_count % 50 == 0) {
             decay_counters();
             filter_connected_components(MIN_BLOB_SIZE);
         }
@@ -2033,6 +2379,32 @@ int main(int argc, char **argv) {
         
         generate_cost_map();
         
+        if (scan_ticks > 0) {
+          do_scan_spin();
+          scan_ticks--;
+          // still do mapping + costmap + rendering as usual
+          continue; // skip planning/following this tick
+        }
+        
+        if (frame_count % 10 == 0) {
+          
+          detect_color_and_mark_on_grid(
+            camera_rgb,
+            camera_depth,
+            COLOR_GREEN
+            50,              // min_pixels threshold
+            MARK_DISK,
+            5,               // mark radius in grid cells
+            1.04,               // camera horizontal FOV
+            0.90,            // NEW: mark at 85% of measured distance
+            robot_node
+          );
+          
+        }
+
+        
+
+        
         if (current_path) {
             bool path_complete = follow_path();
             //bool path_complete = 0;
@@ -2041,9 +2413,10 @@ int main(int argc, char **argv) {
                 printf("Goal reached! Searching for new frontier...\n");
                 destroy_grid_path(current_path);
                 current_path = NULL;
+                scan_ticks = (int)(1.5 / (TIME_STEP / 1000.0)); // ~1.5 seconds
             }
             
-            if (frame_count % 100 == 0) {
+            if (frame_count % 50 == 0) {
                 destroy_grid_path(current_path);
                 current_path = NULL;
             }
@@ -2051,7 +2424,7 @@ int main(int argc, char **argv) {
         
         if (!current_path && frame_count % 50 == 0) {
             path_update_counter++;
-            update_path_to_frontier();
+            update_path_to_frontier(frame_count);
         }
         
         if (frame_count % 5 == 0) {
